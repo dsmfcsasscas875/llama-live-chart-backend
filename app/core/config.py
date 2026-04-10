@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     # Model configuration
     SENTIMENT_MODEL: str = "ProsusAI/finbert"
     STOCK_PERIOD: str = "5y"
+    # Directory where PyTorch .pt checkpoint files are persisted
+    MODEL_CHECKPOINT_DIR: str = "model_checkpoints"
     
     class Config:
         case_sensitive = True

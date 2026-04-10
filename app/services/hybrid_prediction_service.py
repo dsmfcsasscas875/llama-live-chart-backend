@@ -8,7 +8,12 @@ from datetime import datetime, timedelta
 import threading
 import copy
 import os
+import pickle
+import logging
 from app.services.twelvedata_service import twelvedata_service
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 # Configuration based on volatile_stock_predictor_v2.py
 SEQ_LEN = 60
@@ -72,12 +77,16 @@ class HybridPredictionService:
     def __init__(self):
         # Update to VRAM (GPU) as requested
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"HybridPredictionService initialized on: {self.device}")
+        logger.info(f"HybridPredictionService initialized on: {self.device}")
         self.scaler = RobustScaler()
-        self._models = {} # {symbol: list_of_ensemble_models}
-        self._cache = {}
+        self._models  = {}  # {symbol: list_of_ensemble_models}
+        self._scalers = {}  # {symbol: fitted RobustScaler}
+        self._cache   = {}
         self._training_lock = threading.Lock()
-        self._in_progress = set()
+        self._in_progress   = set()
+
+        # Ensure checkpoint directory exists
+        os.makedirs(settings.MODEL_CHECKPOINT_DIR, exist_ok=True)
 
     def calculate_features(self, df):
         """Feature engineering from volatile_stock_predictor_v2.py"""
@@ -202,40 +211,216 @@ class HybridPredictionService:
 
         if best_weights:
             model.load_state_dict(best_weights)
-        return model
+        return model, best_val_loss
 
-    def train_ensemble(self, symbol: str):
-        """Train the ensemble for a given symbol using Twelve Data"""
-        print(f"Starting daily training for {symbol}...")
-        df_raw = twelvedata_service.get_stock_data(symbol)
-        if df_raw.empty:
-            print(f"Could not fetch data for {symbol} from Twelve Data")
-            return
+    # ------------------------------------------------------------------
+    # Checkpoint helpers
+    # ------------------------------------------------------------------
 
-        df = self.calculate_features(df_raw)
-        
-        n = len(df)
-        train_end = int(n * 0.9)
-        
-        train_df_vals = df.values[:train_end]
-        self.scaler = RobustScaler()
-        self.scaler.fit(train_df_vals)
-        data_scaled = self.scaler.transform(df.values)
+    def _checkpoint_dir(self, symbol: str) -> str:
+        path = os.path.join(settings.MODEL_CHECKPOINT_DIR, symbol)
+        os.makedirs(path, exist_ok=True)
+        return path
 
-        X, y = self.create_sequences(data_scaled, SEQ_LEN)
-        X_train_raw, y_train_raw = X[:train_end], y[:train_end]
-        X_val, y_val = X[train_end:], y[train_end:]
+    def _save_checkpoint(self, symbol: str, version: str,
+                         ensemble: list, scaler: RobustScaler,
+                         metrics: dict, db_session) -> str:
+        """
+        Persist ensemble weights + scaler to disk and record the checkpoint
+        in the database.  Returns the checkpoint file path.
+        """
+        from app.models.training_history import ModelCheckpoint
 
-        X_train, y_train = self.augment_sequences(X_train_raw, y_train_raw, noise_std=NOISE_STD, n_copies=2)
-        n_features = X_train.shape[2]
+        ckpt_dir  = self._checkpoint_dir(symbol)
+        ckpt_path = os.path.join(ckpt_dir, f"{version}.pt")
 
-        ensemble = []
-        for seed in range(ENSEMBLE_SIZE):
-            model = self.train_single(X_train, y_train, X_val, y_val, n_features, seed=seed)
-            ensemble.append(model)
-        
-        self._models[symbol] = ensemble
-        print(f"Daily training for {symbol} completed successfully.")
+        payload = {
+            "version":        version,
+            "symbol":         symbol,
+            "n_features":     ensemble[0].cnn[0].in_channels,
+            "ensemble_states": [m.state_dict() for m in ensemble],
+            "scaler":         scaler,
+            "metrics":        metrics,
+            "saved_at":       datetime.utcnow().isoformat(),
+        }
+        torch.save(payload, ckpt_path)
+        logger.info(f"[{symbol}] Checkpoint saved → {ckpt_path}")
+
+        # Persist to DB
+        record = ModelCheckpoint(
+            symbol          = symbol,
+            model_version   = version,
+            checkpoint_path = ckpt_path,
+        )
+        db_session.add(record)
+        db_session.commit()
+        return ckpt_path
+
+    def _load_checkpoint(self, symbol: str, checkpoint_path: str) -> bool:
+        """
+        Load ensemble weights + scaler from a .pt file into memory.
+        Returns True on success, False on failure.
+        """
+        if not os.path.exists(checkpoint_path):
+            logger.warning(f"[{symbol}] Checkpoint file not found: {checkpoint_path}")
+            return False
+        try:
+            payload  = torch.load(checkpoint_path, map_location=self.device)
+            n_feat   = payload["n_features"]
+            ensemble = []
+            for state in payload["ensemble_states"]:
+                m = VolatileModel(n_feat, HIDDEN_SIZE, NUM_HEADS).to(self.device)
+                m.load_state_dict(state)
+                m.eval()
+                ensemble.append(m)
+            self._models[symbol]  = ensemble
+            self._scalers[symbol] = payload["scaler"]
+            logger.info(
+                f"[{symbol}] Loaded checkpoint v{payload['version']} "
+                f"(saved {payload.get('saved_at', 'unknown')})"
+            )
+            return True
+        except Exception as exc:
+            logger.error(f"[{symbol}] Failed to load checkpoint {checkpoint_path}: {exc}")
+            return False
+
+    def load_latest_model(self, symbol: str, db_session) -> bool:
+        """
+        Query the DB for the most recent successful checkpoint for *symbol*
+        and load it into memory.  Returns True if a model was loaded.
+        """
+        from app.models.training_history import ModelCheckpoint
+
+        record = (
+            db_session.query(ModelCheckpoint)
+            .filter(ModelCheckpoint.symbol == symbol)
+            .order_by(ModelCheckpoint.created_at.desc())
+            .first()
+        )
+        if record is None:
+            logger.info(f"[{symbol}] No checkpoint found in DB — model will train from scratch.")
+            return False
+        return self._load_checkpoint(symbol, record.checkpoint_path)
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
+    def train_ensemble(self, symbol: str, db_session=None):
+        """
+        Train the CNN-LSTM ensemble for *symbol*, save a checkpoint to disk,
+        and record training history + checkpoint metadata in the database.
+
+        If *db_session* is None a new session is created internally.
+        On failure the previous in-memory model (if any) is preserved as
+        a fallback so inference keeps working.
+        """
+        from app.models.training_history import TrainingHistory, ModelCheckpoint
+        from app.db.session import SessionLocal
+
+        own_session = db_session is None
+        if own_session:
+            db_session = SessionLocal()
+
+        version = f"{symbol}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        history_record = TrainingHistory(
+            symbol        = symbol,
+            model_version = version,
+            status        = "pending",
+        )
+        db_session.add(history_record)
+        db_session.commit()
+        db_session.refresh(history_record)
+
+        logger.info(f"[{symbol}] Starting training (version={version}) …")
+        try:
+            df_raw = twelvedata_service.get_stock_data(symbol)
+            if df_raw.empty:
+                raise ValueError(f"Could not fetch data for {symbol} from Twelve Data")
+
+            df = self.calculate_features(df_raw)
+
+            n         = len(df)
+            train_end = int(n * 0.9)
+
+            train_df_vals = df.values[:train_end]
+            scaler = RobustScaler()
+            scaler.fit(train_df_vals)
+            data_scaled = scaler.transform(df.values)
+
+            X, y = self.create_sequences(data_scaled, SEQ_LEN)
+            X_train_raw, y_train_raw = X[:train_end], y[:train_end]
+            X_val, y_val             = X[train_end:], y[train_end:]
+
+            X_train, y_train = self.augment_sequences(
+                X_train_raw, y_train_raw, noise_std=NOISE_STD, n_copies=2
+            )
+            n_features = X_train.shape[2]
+
+            ensemble       = []
+            val_losses     = []
+            best_val_losses = []
+            for seed in range(ENSEMBLE_SIZE):
+                model, best_val_loss = self.train_single(
+                    X_train, y_train, X_val, y_val, n_features, seed=seed
+                )
+                ensemble.append(model)
+                best_val_losses.append(best_val_loss)
+                logger.info(
+                    f"[{symbol}] Model {seed + 1}/{ENSEMBLE_SIZE} trained — "
+                    f"best_val_loss={best_val_loss:.6f}"
+                )
+
+            metrics = {
+                "best_val_losses": best_val_losses,
+                "avg_best_val_loss": float(np.mean(best_val_losses)),
+                "ensemble_size": ENSEMBLE_SIZE,
+                "epochs_config": EPOCHS,
+                "patience": PATIENCE,
+            }
+
+            # Persist checkpoint
+            ckpt_path = self._save_checkpoint(
+                symbol, version, ensemble, scaler, metrics, db_session
+            )
+
+            # Update in-memory state
+            self._models[symbol]  = ensemble
+            self._scalers[symbol] = scaler
+            # Keep legacy self.scaler pointing to the last trained symbol
+            self.scaler = scaler
+
+            # Mark training as successful
+            history_record.status  = "success"
+            history_record.metrics = metrics
+            db_session.commit()
+
+            logger.info(
+                f"[{symbol}] Training completed successfully. "
+                f"avg_best_val_loss={metrics['avg_best_val_loss']:.6f} | "
+                f"checkpoint={ckpt_path}"
+            )
+
+        except Exception as exc:
+            error_msg = str(exc)
+            logger.error(f"[{symbol}] Training FAILED: {error_msg}", exc_info=True)
+
+            history_record.status        = "failed"
+            history_record.error_message = error_msg
+            db_session.commit()
+
+            # Fallback: keep whatever model was already in memory
+            if symbol in self._models:
+                logger.warning(
+                    f"[{symbol}] Falling back to previously loaded model in memory."
+                )
+            else:
+                logger.warning(
+                    f"[{symbol}] No fallback model available — predictions will be unavailable."
+                )
+        finally:
+            if own_session:
+                db_session.close()
 
     def forecast_price(self, stock_data_list: list, days_to_predict: int = 14, symbol: str = "UNKNOWN"):
         """Main entry point for forecasting"""
@@ -255,8 +440,9 @@ class HybridPredictionService:
             return {"status": "error", "message": "Failed to fetch data for prediction."}
 
         df = self.calculate_features(df_raw)
-        data_scaled = self.scaler.transform(df.values)
-        
+        scaler = self._scalers.get(symbol, self.scaler)
+        data_scaled = scaler.transform(df.values)
+
         last_sequence = data_scaled[-SEQ_LEN:]
         last_sequence_t = torch.FloatTensor(last_sequence).unsqueeze(0).to(self.device)
 
@@ -268,11 +454,11 @@ class HybridPredictionService:
             all_preds.append(pred)
 
         avg_pred = np.mean(all_preds)
-        
+
         # Inverse transform to get actual price
         dummy = np.zeros((1, df.shape[1]))
         dummy[0, 0] = avg_pred
-        pred_price = self.scaler.inverse_transform(dummy)[0, 0]
+        pred_price = scaler.inverse_transform(dummy)[0, 0]
 
         # Simple 14-day projection based on model's 1-day prediction and historical trend
         last_close = df["Close"].iloc[-1]
@@ -311,7 +497,7 @@ class HybridPredictionService:
                 
                 # Inverse transform
                 d_p = np.zeros((1, df.shape[1])); d_p[0, 0] = avg_p
-                p_val = self.scaler.inverse_transform(d_p)[0, 0]
+                p_val = scaler.inverse_transform(d_p)[0, 0]
                 
                 actual_val = df["Close"].iloc[i]
                 date_str = df.index[i].strftime("%Y-%m-%d")
@@ -341,9 +527,48 @@ class HybridPredictionService:
             with self._training_lock:
                 self._in_progress.remove(symbol)
 
-    def train_daily_all(self, symbols=["NVDA", "AAPL", "TSLA", "MSFT", "GOOGL"]):
-        """Method to be called at startup/daily"""
+    def load_all_models(self, symbols: list, db_session=None):
+        """
+        Load the latest persisted checkpoint for every symbol in *symbols*.
+        Called at service startup so predictions are available immediately
+        without waiting for a full re-train.
+
+        Returns a dict {symbol: True/False} indicating which symbols were
+        successfully restored from disk.
+        """
+        from app.db.session import SessionLocal
+
+        own_session = db_session is None
+        if own_session:
+            db_session = SessionLocal()
+
+        results = {}
+        try:
+            for sym in symbols:
+                loaded = self.load_latest_model(sym, db_session)
+                results[sym] = loaded
+                if loaded:
+                    logger.info(f"[{sym}] Model restored from checkpoint at startup.")
+                else:
+                    logger.info(
+                        f"[{sym}] No checkpoint found — model will be trained on first request."
+                    )
+        finally:
+            if own_session:
+                db_session.close()
+
+        return results
+
+    def train_daily_all(self, symbols: list = None):
+        """
+        Re-train all symbols.  Called by the daily cron job.
+        Each symbol is trained independently; a failure in one does not
+        prevent the others from running.
+        """
+        if symbols is None:
+            symbols = ["NVDA", "AAPL", "TSLA", "MSFT", "GOOGL"]
         for sym in symbols:
             self.train_ensemble(sym)
+
 
 hybrid_prediction_service = HybridPredictionService()
