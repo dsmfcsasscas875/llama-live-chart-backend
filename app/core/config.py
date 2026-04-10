@@ -14,7 +14,7 @@ class Settings(BaseSettings):
             return self.DATABASE_URL.replace("postgres://", "postgresql://")
         return self.SQLALCHEMY_DATABASE_URI
     
-    FRONTEND_URL: str = "http://localhost:3000"
+    FRONTEND_URL: str = "https://exchangemonster.tech" # Lütfen kendi vercel adresiniz ile değiştirin
     
     # Security
     SECRET_KEY: str = "supersecretkeychangeinproduction"
@@ -25,10 +25,6 @@ class Settings(BaseSettings):
     RESEND_API_KEY: str | None = None
     GROQ_API_KEY: str | None = None
     TWELVE_DATA_API_KEY: str | None = None
-    
-    # Model configuration
-    SENTIMENT_MODEL: str = "ProsusAI/finbert"
-    STOCK_PERIOD: str = "5y"
     
     class Config:
         case_sensitive = True

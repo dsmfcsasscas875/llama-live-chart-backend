@@ -46,7 +46,8 @@ def job_train_models():
 
 class WatchlistScheduler:
     def __init__(self):
-        self.scheduler = BackgroundScheduler(timezone=pytz.UTC)
+        self.ist_tz = pytz.timezone('Europe/Istanbul')
+        self.scheduler = BackgroundScheduler(timezone=self.ist_tz)
         
     def start(self):
         # 1. Watchlist Updates
@@ -56,15 +57,22 @@ class WatchlistScheduler:
             id='watchlist_daily_job'
         )
 
-        # 2. Model Training (Once a day at midnight UTC)
+        # 2. Model Training (Every Tue-Sat at 03:00 AM TRT - After Market Closes)
+        # We skip Sun-Mon because price data doesn't change on weekends.
         self.scheduler.add_job(
             job_train_models,
-            CronTrigger(hour=0, minute=0, timezone=pytz.UTC),
+            CronTrigger(hour=3, minute=0, day_of_week='tue-sat', timezone=self.ist_tz),
             id='model_training_daily_job'
         )
 
         # 3. Trigger initial training at startup in a separate thread to not block FastAPI
-        threading.Thread(target=job_train_models, daemon=True).start()
+        # We wait 30 seconds to let the system fully boot up and settle first
+        def delayed_startup():
+            import time
+            time.sleep(30)
+            job_train_models()
+            
+        threading.Thread(target=delayed_startup, daemon=True).start()
 
         self.scheduler.start()
         print("Scheduler started. Background tasks are running.")

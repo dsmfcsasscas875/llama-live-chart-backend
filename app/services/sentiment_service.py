@@ -18,57 +18,8 @@ class SentimentService:
         self.model = "llama-3.3-70b-versatile" 
         self._cache = {} # {symbol: {data: result, timestamp: datetime}}
         
-        # Finnhub API Anahtarı
-        
-    async def get_finnhub_news(self, symbol: str) -> List[Dict]:
-        """Finnhub API üzerinden profesyonel borsa haberlerini çeker"""
-        try:
-            # Son 7 günlük haberleri getir
-            end_date = datetime.now().strftime('%Y-%m-%d')
-            start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-            
-            # Kripto sembollerini Finnhub formatına çevir (BTC -> BINANCE:BTCUSDT)
-            # Not: Finnhub kripto için bazen farklı semboller isteyebilir ama 
-            # borsa sembolleri (AAPL, TSLA) için direkt çalışır.
-            search_symbol = symbol
-            if symbol in ["BTC", "ETH", "SOL"]:
-                search_symbol = f"BINANCE:{symbol}USDT"
-
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    self.finnhub_url,
-                    params={
-                        "symbol": search_symbol,
-                        "from": start_date,
-                        "to": end_date,
-                        "token": self.finnhub_token
-                    },
-                    timeout=10.0
-                )
-                
-                if response.status_code != 200:
-                    print(f"Finnhub API Error ({response.status_code}): {response.text}")
-                    return []
-                
-                data = response.json()
-                news_items = []
-                
-                # Sadece ilk 10 haberi al
-                for entry in data[:10]:
-                    news_items.append({
-                        'title': entry.get('headline', ''),
-                        'summary': entry.get('summary', ''),
-                        'link': entry.get('url', '#'),
-                        'publisher': entry.get('source', 'Finnhub'),
-                        'published': datetime.fromtimestamp(entry.get('datetime', 0)).strftime('%Y-%m-%d')
-                    })
-                return news_items
-        except Exception as e:
-            print(f"Finnhub fetch error: {e}")
-            return []
-
     def get_google_news(self, symbol: str) -> List[Dict]:
-        """Google News RSS üzerinden en güncel haberleri çeker (Yedek kaynak)"""
+        """Google News RSS üzerinden en güncel haberleri çeker"""
         try:
             query = urllib.parse.quote(f"{symbol} stock news market analysis")
             url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
@@ -97,12 +48,8 @@ class SentimentService:
             if datetime.now() - cache_entry['timestamp'] < timedelta(hours=1):
                 return cache_entry['data']
 
-        # Önce Finnhub dene, boş gelirse Google News'e bak
-        news_list = await self.get_finnhub_news(symbol)
-        
-        if not news_list:
-            print(f"No news from Finnhub for {symbol}, falling back to Google News...")
-            news_list = self.get_google_news(symbol)
+        # Get news from Google News
+        news_list = self.get_google_news(symbol)
             
         if not news_list:
             return []

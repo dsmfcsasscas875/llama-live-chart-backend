@@ -7,5 +7,9 @@ connect_args = {}
 if db_uri.startswith("sqlite"):
     connect_args["check_same_thread"] = False
 
-engine = create_engine(db_uri, connect_args=connect_args)
+engine = create_engine(
+    settings.sync_database_uri, 
+    connect_args={"check_same_thread": False} if "sqlite" in settings.sync_database_uri else {},
+    pool_pre_ping=True
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

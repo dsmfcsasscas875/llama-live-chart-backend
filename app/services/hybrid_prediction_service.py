@@ -1,4 +1,7 @@
 import torch
+import time
+torch.set_num_threads(1) # Prevent CPU starvation by limiting torch to 1 thread
+
 import torch.nn as nn
 import numpy as np
 import pandas as pd
@@ -8,6 +11,8 @@ from datetime import datetime, timedelta
 import threading
 import copy
 import os
+import joblib # For saving/loading the scaler
+from pathlib import Path
 from app.services.twelvedata_service import twelvedata_service
 
 # Configuration based on volatile_stock_predictor_v2.py
@@ -19,7 +24,7 @@ LEARNING_RATE = 0.0005
 GRAD_CLIP = 0.5
 PATIENCE = 25
 NUM_HEADS = 4
-ENSEMBLE_SIZE = 5
+ENSEMBLE_SIZE = 5 # Kept at 5 as requested by user
 NOISE_STD = 0.005
 
 class VolatileModel(nn.Module):
@@ -78,6 +83,16 @@ class HybridPredictionService:
         self._cache = {}
         self._training_lock = threading.Lock()
         self._in_progress = set()
+        self._last_trained = {} # {symbol: datetime}
+        
+        # Persistence setup - Using absolute path for better Volume mounting compatibility
+        base_path = Path(__file__).resolve().parent.parent.parent # Project root
+        self.model_dir = base_path / "data" / "models"
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Model persistence directory set to: {self.model_dir.resolve()}")
+        
+        # Try to load existing models at initialization
+        self.load_all_existing()
 
     def calculate_features(self, df):
         """Feature engineering from volatile_stock_predictor_v2.py"""
@@ -147,12 +162,14 @@ class HybridPredictionService:
         torch.manual_seed(seed)
         np.random.seed(seed)
 
+        # Move training data to VRAM immediately for faster iteration
+        train_x_t = torch.as_tensor(X_train, device=self.device, dtype=torch.float32)
+        train_y_t = torch.as_tensor(y_train, device=self.device, dtype=torch.float32)
+        
         train_loader = DataLoader(
-            TensorDataset(
-                torch.FloatTensor(X_train).to(self.device),
-                torch.FloatTensor(y_train).to(self.device)
-            ),
-            batch_size=BATCH_SIZE, shuffle=False
+            TensorDataset(train_x_t, train_y_t),
+            batch_size=BATCH_SIZE, 
+            shuffle=False
         )
 
         model = VolatileModel(n_features, HIDDEN_SIZE, NUM_HEADS).to(self.device)
@@ -167,8 +184,8 @@ class HybridPredictionService:
             optimizer, T_0=30, T_mult=2, eta_min=1e-6
         )
 
-        X_val_t = torch.FloatTensor(X_val).to(self.device)
-        y_val_t = torch.FloatTensor(y_val).to(self.device)
+        X_val_t = torch.as_tensor(X_val, device=self.device, dtype=torch.float32)
+        y_val_t = torch.as_tensor(y_val, device=self.device, dtype=torch.float32)
 
         best_val_loss = float("inf")
         best_weights = None
@@ -235,7 +252,81 @@ class HybridPredictionService:
             ensemble.append(model)
         
         self._models[symbol] = ensemble
-        print(f"Daily training for {symbol} completed successfully.")
+        self._last_trained[symbol] = datetime.now()
+        
+        # Persist to disk
+        self.save_ensemble(symbol)
+        
+        # Clear VRAM cache after training
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        print(f"Daily training for {symbol} completed successfully and models are on {self.device} VRAM.")
+
+    def save_ensemble(self, symbol: str):
+        """Save ensemble models and scaler to disk"""
+        try:
+            symbol_dir = self.model_dir / symbol
+            symbol_dir.mkdir(exist_ok=True)
+            
+            # Save scaler
+            joblib.dump(self.scaler, symbol_dir / "scaler.gz")
+            
+            # Save models
+            for i, model in enumerate(self._models[symbol]):
+                torch.save(model.state_dict(), symbol_dir / f"model_v2_{i}.pth")
+                
+            print(f"Persistence: Saved models and scaler for {symbol} to {symbol_dir}")
+        except Exception as e:
+            print(f"Error saving model for {symbol}: {e}")
+
+    def load_all_existing(self):
+        """Scans the model directory and loads everything found"""
+        if not self.model_dir.exists():
+            return
+            
+        for symbol_path in self.model_dir.iterdir():
+            if symbol_path.is_dir():
+                symbol = symbol_path.name
+                self.load_ensemble(symbol)
+
+    def load_ensemble(self, symbol: str):
+        """Load ensemble models and scaler from disk"""
+        try:
+            symbol_dir = self.model_dir / symbol
+            scaler_path = symbol_dir / "scaler.gz"
+            
+            if not scaler_path.exists():
+                return False
+                
+            # Load scaler
+            self.scaler = joblib.load(scaler_path)
+            
+            # Find n_features from scaler/data if possible, or use a sample
+            # Since we know our architecture, we can initialize it. 
+            # Features count is 25 in version 2.
+            n_features = 25 
+            
+            ensemble = []
+            for i in range(ENSEMBLE_SIZE):
+                model_path = symbol_dir / f"model_v2_{i}.pth"
+                if model_path.exists():
+                    model = VolatileModel(n_features, HIDDEN_SIZE, NUM_HEADS).to(self.device)
+                    # Load onto correct device
+                    model.load_state_dict(torch.load(model_path, map_location=self.device))
+                    model.eval()
+                    ensemble.append(model)
+            
+            if ensemble:
+                self._models[symbol] = ensemble
+                # Estimate last trained from file timestamp
+                mtime = os.path.getmtime(scaler_path)
+                self._last_trained[symbol] = datetime.fromtimestamp(mtime)
+                print(f"Persistence: Loaded existing ensemble for {symbol} (Last trained: {self._last_trained[symbol]})")
+                return True
+        except Exception as e:
+            print(f"Error loading model for {symbol}: {e}")
+        return False
 
     def forecast_price(self, stock_data_list: list, days_to_predict: int = 14, symbol: str = "UNKNOWN"):
         """Main entry point for forecasting"""
@@ -258,7 +349,7 @@ class HybridPredictionService:
         data_scaled = self.scaler.transform(df.values)
         
         last_sequence = data_scaled[-SEQ_LEN:]
-        last_sequence_t = torch.FloatTensor(last_sequence).unsqueeze(0).to(self.device)
+        last_sequence_t = torch.as_tensor(last_sequence, device=self.device, dtype=torch.float32).unsqueeze(0)
 
         all_preds = []
         for model in self._models[symbol]:
@@ -300,7 +391,7 @@ class HybridPredictionService:
         if len(data_scaled) > SEQ_LEN + hist_size:
             for i in range(len(data_scaled) - hist_size, len(data_scaled)):
                 seq = data_scaled[i-SEQ_LEN:i]
-                seq_t = torch.FloatTensor(seq).unsqueeze(0).to(self.device)
+                seq_t = torch.as_tensor(seq, device=self.device, dtype=torch.float32).unsqueeze(0)
                 
                 sum_p = 0
                 for model in self._models[symbol]:
@@ -327,6 +418,7 @@ class HybridPredictionService:
             "prediction_1d": float(pred_price),
             "forecast": forecast,
             "backtest": backtest,
+            "last_trained": self._last_trained.get(symbol, "Never"),
             "status": "success"
         }
 
@@ -344,6 +436,17 @@ class HybridPredictionService:
     def train_daily_all(self, symbols=["NVDA", "AAPL", "TSLA", "MSFT", "GOOGL"]):
         """Method to be called at startup/daily"""
         for sym in symbols:
-            self.train_ensemble(sym)
+            # Only train if model doesn't exist OR was trained more than 24h ago
+            should_train = True
+            if sym in self._models:
+                last_time = self._last_trained.get(sym)
+                if last_time and (datetime.now() - last_time).total_seconds() < 86400:
+                    should_train = False
+                    print(f"Startup: Skipping training for {sym}, fresh model already exists.")
+            
+            if should_train:
+                self.train_ensemble(sym)
+                time.sleep(5) # Give the system some breathing room between symbols
+
 
 hybrid_prediction_service = HybridPredictionService()
