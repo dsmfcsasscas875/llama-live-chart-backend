@@ -37,9 +37,10 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000", 
         "http://127.0.0.1:3000",
+        "https://exchangemonster.tech",
         "https://exchangemonster.vercel.app",
         "https://*.vercel.app",
-        "*" # Temporary for ease of deployment, change to specific domains later
+        "*" 
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -49,7 +50,7 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     TrustedHostMiddleware, 
-    allowed_hosts=["localhost", "127.0.0.1", "*.railway.app", "exchangemonster.vercel.app", "*.vercel.app"]
+    allowed_hosts=["localhost", "127.0.0.1", "*.railway.app", "exchangemonster.tech", "*.exchangemonster.tech", "exchangemonster.vercel.app", "*.vercel.app"]
 )
 
 @app.exception_handler(Exception)
